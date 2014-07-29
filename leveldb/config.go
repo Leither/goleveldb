@@ -13,10 +13,12 @@ const (
 	kL0_CompactionTrigger float64 = 4
 
 	// Soft limit on number of level-0 files.  We slow down writes at this point.
-	kL0_SlowdownWritesTrigger = 8
+	//kL0_SlowdownWritesTrigger = 8
+	kL0_SlowdownWritesTrigger = 16
 
 	// Maximum number of level-0 files.  We stop writes at this point.
-	kL0_StopWritesTrigger = 12
+	//kL0_StopWritesTrigger = 12
+	kL0_StopWritesTrigger = 64
 
 	// Maximum level to which a new compacted memdb is pushed if it
 	// does not create overlap.  We try to push to level 2 to avoid the
@@ -27,11 +29,13 @@ const (
 	kMaxMemCompactLevel = 2
 
 	// Maximum size of a table.
-	kMaxTableSize = 2 * 1048576
+	//kMaxTableSize = 2 * 1048576
+	kMaxTableSize = 32 * 1048576
 
 	// Maximum bytes of overlaps in grandparent (i.e., level+2) before we
 	// stop building a single file in a level->level+1 compaction.
-	kMaxGrandParentOverlapBytes = 10 * kMaxTableSize
+	//kMaxGrandParentOverlapBytes = 10 * kMaxTableSize
+	kMaxGrandParentOverlapBytes = 20 * kMaxTableSize
 
 	// Maximum number of bytes in all compacted files.  We avoid expanding
 	// the lower level file set of a compaction if it would make the

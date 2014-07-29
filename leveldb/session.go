@@ -13,11 +13,11 @@ import (
 	"sync"
 	"sync/atomic"
 
-	"github.com/syndtr/goleveldb/leveldb/iterator"
-	"github.com/syndtr/goleveldb/leveldb/journal"
-	"github.com/syndtr/goleveldb/leveldb/opt"
-	"github.com/syndtr/goleveldb/leveldb/storage"
-	"github.com/syndtr/goleveldb/leveldb/util"
+	"github.com/siddontang/goleveldb/leveldb/iterator"
+	"github.com/siddontang/goleveldb/leveldb/journal"
+	"github.com/siddontang/goleveldb/leveldb/opt"
+	"github.com/siddontang/goleveldb/leveldb/storage"
+	"github.com/siddontang/goleveldb/leveldb/util"
 )
 
 // session represent a persistent database session.
