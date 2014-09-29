@@ -12,7 +12,7 @@ import (
 	"fmt"
 	"io"
 
-	"github.com/siddontang/go-snappy/snappy"
+	"github.com/siddontang/go/snappy"
 
 	"github.com/siddontang/goleveldb/leveldb/comparer"
 	"github.com/siddontang/goleveldb/leveldb/filter"

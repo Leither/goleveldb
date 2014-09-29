@@ -14,7 +14,7 @@ import (
 	"sort"
 	"strings"
 
-	"github.com/siddontang/go-snappy/snappy"
+	"github.com/siddontang/go/snappy"
 
 	"github.com/siddontang/goleveldb/leveldb/cache"
 	"github.com/siddontang/goleveldb/leveldb/comparer"
