@@ -23,11 +23,11 @@ type testBatch struct {
 	rec []*tbRec
 }
 
-func (p *testBatch) put(key, value []byte, seq uint64) {
+func (p *testBatch) Put(key, value []byte) {
 	p.rec = append(p.rec, &tbRec{tVal, key, value})
 }
 
-func (p *testBatch) delete(key []byte, seq uint64) {
+func (p *testBatch) Delete(key []byte) {
 	p.rec = append(p.rec, &tbRec{tDel, key, nil})
 }
 
@@ -35,15 +35,15 @@ func compareBatch(t *testing.T, b1, b2 *Batch) {
 	if b1.seq != b2.seq {
 		t.Errorf("invalid seq number want %d, got %d", b1.seq, b2.seq)
 	}
-	if b1.len() != b2.len() {
-		t.Fatalf("invalid record length want %d, got %d", b1.len(), b2.len())
+	if b1.Len() != b2.Len() {
+		t.Fatalf("invalid record length want %d, got %d", b1.Len(), b2.Len())
 	}
 	p1, p2 := new(testBatch), new(testBatch)
-	err := b1.replay(p1)
+	err := b1.Replay(p1)
 	if err != nil {
 		t.Fatal("error when replaying batch 1: ", err)
 	}
-	err = b2.replay(p2)
+	err = b2.Replay(p2)
 	if err != nil {
 		t.Fatal("error when replaying batch 2: ", err)
 	}
