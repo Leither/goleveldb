@@ -7,7 +7,6 @@
 package leveldb
 
 import (
-	"errors"
 	"sync/atomic"
 	"unsafe"
 
@@ -47,11 +46,12 @@ type version struct {
 
 	cSeek unsafe.Pointer
 
-	ref  int
+	ref int
+	// Succeeding version.
 	next *version
 }
 
-func (v *version) release_NB() {
+func (v *version) releaseNB() {
 	v.ref--
 	if v.ref > 0 {
 		return
@@ -77,13 +77,13 @@ func (v *version) release_NB() {
 		}
 	}
 
-	v.next.release_NB()
+	v.next.releaseNB()
 	v.next = nil
 }
 
 func (v *version) release() {
 	v.s.vmu.Lock()
-	v.release_NB()
+	v.releaseNB()
 	v.s.vmu.Unlock()
 }
 
@@ -130,10 +130,11 @@ func (v *version) get(ikey iKey, ro *opt.ReadOptions) (value []byte, tcomp bool,
 		tset  *tSet
 		tseek bool
 
-		l0found bool
-		l0seq   uint64
-		l0vt    vType
-		l0val   []byte
+		// Level-0.
+		zfound bool
+		zseq   uint64
+		zkt    kType
+		zval   []byte
 	)
 
 	err = ErrNotFound
@@ -150,55 +151,52 @@ func (v *version) get(ikey iKey, ro *opt.ReadOptions) (value []byte, tcomp bool,
 			}
 		}
 
-		ikey__, val_, err_ := v.s.tops.find(t, ikey, ro)
-		switch err_ {
+		fikey, fval, ferr := v.s.tops.find(t, ikey, ro)
+		switch ferr {
 		case nil:
 		case ErrNotFound:
 			return true
 		default:
-			err = err_
+			err = ferr
 			return false
 		}
 
-		ikey_ := iKey(ikey__)
-		if seq, vt, ok := ikey_.parseNum(); ok {
-			if v.s.icmp.uCompare(ukey, ikey_.ukey()) != 0 {
-				return true
-			}
-
-			if level == 0 {
-				if seq >= l0seq {
-					l0found = true
-					l0seq = seq
-					l0vt = vt
-					l0val = val_
+		if fukey, fseq, fkt, fkerr := parseIkey(fikey); fkerr == nil {
+			if v.s.icmp.uCompare(ukey, fukey) == 0 {
+				if level == 0 {
+					if fseq >= zseq {
+						zfound = true
+						zseq = fseq
+						zkt = fkt
+						zval = fval
+					}
+				} else {
+					switch fkt {
+					case ktVal:
+						value = fval
+						err = nil
+					case ktDel:
+					default:
+						panic("leveldb: invalid iKey type")
+					}
+					return false
 				}
-			} else {
-				switch vt {
-				case tVal:
-					value = val_
-					err = nil
-				case tDel:
-				default:
-					panic("leveldb: invalid internal key type")
-				}
-				return false
 			}
 		} else {
-			err = errors.New("leveldb: internal key corrupted")
+			err = fkerr
 			return false
 		}
 
 		return true
 	}, func(level int) bool {
-		if l0found {
-			switch l0vt {
-			case tVal:
-				value = l0val
+		if zfound {
+			switch zkt {
+			case ktVal:
+				value = zval
 				err = nil
-			case tDel:
+			case ktDel:
 			default:
-				panic("leveldb: invalid internal key type")
+				panic("leveldb: invalid iKey type")
 			}
 			return false
 		}
@@ -222,7 +220,7 @@ func (v *version) getIterators(slice *util.Range, ro *opt.ReadOptions) (its []it
 			continue
 		}
 
-		it := iterator.NewIndexedIterator(tables.newIndexIterator(v.s.tops, v.s.icmp, slice, ro), strict, true)
+		it := iterator.NewIndexedIterator(tables.newIndexIterator(v.s.tops, v.s.icmp, slice, ro), strict)
 		its = append(its, it)
 	}
 
@@ -340,7 +338,7 @@ func (v *version) needCompaction() bool {
 type versionStaging struct {
 	base   *version
 	tables [kNumLevels]struct {
-		added   map[uint64]ntRecord
+		added   map[uint64]atRecord
 		deleted map[uint64]struct{}
 	}
 }
@@ -367,7 +365,7 @@ func (p *versionStaging) commit(r *sessionRecord) {
 		tm := &(p.tables[r.level])
 
 		if tm.added == nil {
-			tm.added = make(map[uint64]ntRecord)
+			tm.added = make(map[uint64]atRecord)
 		}
 		tm.added[r.num] = r
 
@@ -402,7 +400,7 @@ func (p *versionStaging) finish() *version {
 
 		// New tables.
 		for _, r := range tm.added {
-			nt = append(nt, r.makeFile(p.base.s))
+			nt = append(nt, p.base.s.tableFileFromRecord(r))
 		}
 
 		// Sort tables.
@@ -429,7 +427,7 @@ func (vr *versionReleaser) Release() {
 	v := vr.v
 	v.s.vmu.Lock()
 	if !vr.once {
-		v.release_NB()
+		v.releaseNB()
 		vr.once = true
 	}
 	v.s.vmu.Unlock()

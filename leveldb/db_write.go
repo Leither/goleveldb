@@ -59,7 +59,7 @@ func (db *DB) rotateMem(n int) (mem *memDB, err error) {
 	}
 
 	// Schedule memdb compaction.
-	db.compTrigger(db.mcompTriggerC)
+	db.compSendTrigger(db.mcompCmdC)
 	return
 }
 
@@ -193,7 +193,9 @@ drain:
 			return
 		case db.journalC <- b:
 			// Write into memdb
-			b.memReplay(mem.mdb)
+			if berr := b.memReplay(mem.mdb); berr != nil {
+				panic(berr)
+			}
 		}
 		// Wait for journal writer
 		select {
@@ -203,7 +205,9 @@ drain:
 		case err = <-db.journalAckC:
 			if err != nil {
 				// Revert memdb if error detected
-				b.revertMemReplay(mem.mdb)
+				if berr := b.revertMemReplay(mem.mdb); berr != nil {
+					panic(berr)
+				}
 				return
 			}
 		}
@@ -212,7 +216,9 @@ drain:
 		if err != nil {
 			return
 		}
-		b.memReplay(mem.mdb)
+		if berr := b.memReplay(mem.mdb); berr != nil {
+			panic(berr)
+		}
 	}
 
 	// Set last seq number.

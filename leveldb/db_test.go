@@ -151,7 +151,10 @@ func (h *dbHarness) maxNextLevelOverlappingBytes(want uint64) {
 	t := h.t
 	db := h.db
 
-	var res uint64
+	var (
+		maxOverlaps uint64
+		maxLevel    int
+	)
 	v := db.s.version()
 	for i, tt := range v.tables[1 : len(v.tables)-1] {
 		level := i + 1
@@ -159,15 +162,18 @@ func (h *dbHarness) maxNextLevelOverlappingBytes(want uint64) {
 		for _, t := range tt {
 			r := next.getOverlaps(nil, db.s.icmp, t.imin.ukey(), t.imax.ukey(), false)
 			sum := r.size()
-			if sum > res {
-				res = sum
+			if sum > maxOverlaps {
+				maxOverlaps = sum
+				maxLevel = level
 			}
 		}
 	}
 	v.release()
 
-	if res > want {
-		t.Errorf("next level overlapping bytes is more than %d, got=%d", want, res)
+	if maxOverlaps > want {
+		t.Errorf("next level most overlapping bytes is more than %d, got=%d level=%d", want, maxOverlaps, maxLevel)
+	} else {
+		t.Logf("next level most overlapping bytes is %d, level=%d want=%d", maxOverlaps, maxLevel, want)
 	}
 }
 
@@ -240,7 +246,7 @@ func (h *dbHarness) allEntriesFor(key, want string) {
 	db := h.db
 	s := db.s
 
-	ikey := newIKey([]byte(key), kMaxSeq, tVal)
+	ikey := newIkey([]byte(key), kMaxSeq, ktVal)
 	iter := db.newRawIterator(nil, nil)
 	if !iter.Seek(ikey) && iter.Error() != nil {
 		t.Error("AllEntries: error during seek, err: ", iter.Error())
@@ -249,19 +255,18 @@ func (h *dbHarness) allEntriesFor(key, want string) {
 	res := "[ "
 	first := true
 	for iter.Valid() {
-		rkey := iKey(iter.Key())
-		if _, t, ok := rkey.parseNum(); ok {
-			if s.icmp.uCompare(ikey.ukey(), rkey.ukey()) != 0 {
+		if ukey, _, kt, kerr := parseIkey(iter.Key()); kerr == nil {
+			if s.icmp.uCompare(ikey.ukey(), ukey) != 0 {
 				break
 			}
 			if !first {
 				res += ", "
 			}
 			first = false
-			switch t {
-			case tVal:
+			switch kt {
+			case ktVal:
 				res += string(iter.Value())
-			case tDel:
+			case ktDel:
 				res += "DEL"
 			}
 		} else {
@@ -326,6 +331,8 @@ func (h *dbHarness) compactMem() {
 	t := h.t
 	db := h.db
 
+	t.Log("starting memdb compaction")
+
 	db.writeLockC <- struct{}{}
 	defer func() {
 		<-db.writeLockC
@@ -341,6 +348,8 @@ func (h *dbHarness) compactMem() {
 	if h.totalTables() == 0 {
 		t.Error("zero tables after mem compaction")
 	}
+
+	t.Log("memdb compaction done")
 }
 
 func (h *dbHarness) compactRangeAtErr(level int, min, max string, wanterr bool) {
@@ -355,6 +364,8 @@ func (h *dbHarness) compactRangeAtErr(level int, min, max string, wanterr bool) 
 		_max = []byte(max)
 	}
 
+	t.Logf("starting table range compaction: level=%d, min=%q, max=%q", level, min, max)
+
 	if err := db.compSendRange(db.tcompCmdC, level, _min, _max); err != nil {
 		if wanterr {
 			t.Log("CompactRangeAt: got error (expected): ", err)
@@ -364,6 +375,8 @@ func (h *dbHarness) compactRangeAtErr(level int, min, max string, wanterr bool) 
 	} else if wanterr {
 		t.Error("CompactRangeAt: expect error")
 	}
+
+	t.Log("table range compaction done")
 }
 
 func (h *dbHarness) compactRangeAt(level int, min, max string) {
@@ -373,6 +386,8 @@ func (h *dbHarness) compactRangeAt(level int, min, max string) {
 func (h *dbHarness) compactRange(min, max string) {
 	t := h.t
 	db := h.db
+
+	t.Logf("starting DB range compaction: min=%q, max=%q", min, max)
 
 	var r util.Range
 	if min != "" {
@@ -384,6 +399,8 @@ func (h *dbHarness) compactRange(min, max string) {
 	if err := db.CompactRange(r); err != nil {
 		t.Error("CompactRange: got error: ", err)
 	}
+
+	t.Log("DB range compaction done")
 }
 
 func (h *dbHarness) sizeAssert(start, limit string, low, hi uint64) {
@@ -505,10 +522,10 @@ func Test_FieldsAligned(t *testing.T) {
 	p1 := new(DB)
 	testAligned(t, "DB.seq", unsafe.Offsetof(p1.seq))
 	p2 := new(session)
-	testAligned(t, "session.stFileNum", unsafe.Offsetof(p2.stFileNum))
+	testAligned(t, "session.stNextFileNum", unsafe.Offsetof(p2.stNextFileNum))
 	testAligned(t, "session.stJournalNum", unsafe.Offsetof(p2.stJournalNum))
 	testAligned(t, "session.stPrevJournalNum", unsafe.Offsetof(p2.stPrevJournalNum))
-	testAligned(t, "session.stSeq", unsafe.Offsetof(p2.stSeq))
+	testAligned(t, "session.stSeqNum", unsafe.Offsetof(p2.stSeqNum))
 }
 
 func TestDb_Locking(t *testing.T) {
@@ -1002,6 +1019,7 @@ func TestDb_SparseMerge(t *testing.T) {
 	h.put("C", "vc2")
 	h.compactMem()
 
+	h.waitCompaction()
 	h.maxNextLevelOverlappingBytes(20 * 1048576)
 	h.compactRangeAt(0, "", "")
 	h.waitCompaction()

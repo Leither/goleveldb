@@ -8,17 +8,17 @@
 package memdb
 
 import (
-	"errors"
 	"math/rand"
 	"sync"
 
 	"github.com/siddontang/goleveldb/leveldb/comparer"
+	"github.com/siddontang/goleveldb/leveldb/errors"
 	"github.com/siddontang/goleveldb/leveldb/iterator"
 	"github.com/siddontang/goleveldb/leveldb/util"
 )
 
 var (
-	ErrNotFound     = util.ErrNotFound
+	ErrNotFound     = errors.ErrNotFound
 	ErrIterReleased = errors.New("leveldb/memdb: iterator released")
 )
 

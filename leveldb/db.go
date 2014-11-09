@@ -8,7 +8,6 @@ package leveldb
 
 import (
 	"container/list"
-	"errors"
 	"fmt"
 	"io"
 	"os"
@@ -18,6 +17,7 @@ import (
 	"sync/atomic"
 	"time"
 
+	"github.com/siddontang/goleveldb/leveldb/errors"
 	"github.com/siddontang/goleveldb/leveldb/iterator"
 	"github.com/siddontang/goleveldb/leveldb/journal"
 	"github.com/siddontang/goleveldb/leveldb/memdb"
@@ -61,14 +61,12 @@ type DB struct {
 	journalAckC  chan error
 
 	// Compaction.
-	tcompCmdC     chan cCmd
-	tcompPauseC   chan chan<- struct{}
-	tcompTriggerC chan struct{}
-	mcompCmdC     chan cCmd
-	mcompTriggerC chan struct{}
-	compErrC      chan error
-	compErrSetC   chan error
-	compStats     [kNumLevels]cStats
+	tcompCmdC   chan cCmd
+	tcompPauseC chan chan<- struct{}
+	mcompCmdC   chan cCmd
+	compErrC    chan error
+	compErrSetC chan error
+	compStats   [kNumLevels]cStats
 
 	// Close.
 	closeW sync.WaitGroup
@@ -83,7 +81,7 @@ func openDB(s *session) (*DB, error) {
 	db := &DB{
 		s: s,
 		// Initial sequence
-		seq: s.stSeq,
+		seq: s.stSeqNum,
 		// MemDB
 		memPool: make(chan *memdb.DB, 1),
 		// Snapshot
@@ -96,13 +94,11 @@ func openDB(s *session) (*DB, error) {
 		journalC:     make(chan *Batch),
 		journalAckC:  make(chan error),
 		// Compaction
-		tcompCmdC:     make(chan cCmd),
-		tcompPauseC:   make(chan chan<- struct{}),
-		tcompTriggerC: make(chan struct{}, 1),
-		mcompCmdC:     make(chan cCmd),
-		mcompTriggerC: make(chan struct{}, 1),
-		compErrC:      make(chan error),
-		compErrSetC:   make(chan error),
+		tcompCmdC:   make(chan cCmd),
+		tcompPauseC: make(chan chan<- struct{}),
+		mcompCmdC:   make(chan cCmd),
+		compErrC:    make(chan error),
+		compErrSetC: make(chan error),
 		// Close
 		closeC: make(chan struct{}),
 	}
@@ -121,14 +117,14 @@ func openDB(s *session) (*DB, error) {
 		return nil, err
 	}
 
-	// Don't include compaction error goroutine into wait group.
+	// Doesn't need to be included in the wait group.
 	go db.compactionError()
+	go db.mpoolDrain()
 
 	db.closeW.Add(3)
 	go db.tCompaction()
 	go db.mCompaction()
 	go db.jWriter()
-	go db.mpoolDrain()
 
 	s.logf("db@open done T·%v", time.Since(start))
 
@@ -324,7 +320,7 @@ func recoverTable(s *session, o *opt.Options) error {
 		var tSeq uint64
 		var tgood, tcorrupted, blockerr int
 		var imin, imax []byte
-		tr := table.NewReader(reader, size, nil, bpool, o)
+		tr := table.NewReader(reader, size, storage.NewFileInfo(file), nil, bpool, o)
 		iter := tr.NewIterator(nil, nil)
 		iter.(iterator.ErrorCallbackSetter).SetErrorCallback(func(err error) {
 			s.logf("table@recovery found error @%d %q", file.Num(), err)
@@ -334,8 +330,8 @@ func recoverTable(s *session, o *opt.Options) error {
 		// Scan the table.
 		for iter.Next() {
 			key := iter.Key()
-			_, seq, _, ok := parseIkey(key)
-			if !ok {
+			_, seq, _, kerr := parseIkey(key)
+			if kerr != nil {
 				tcorrupted++
 				continue
 			}
@@ -403,7 +399,7 @@ func recoverTable(s *session, o *opt.Options) error {
 	}
 
 	// Set sequence number.
-	rec.setSeq(mSeq + 1)
+	rec.setSeqNum(mSeq + 1)
 
 	// Create new manifest.
 	if err := s.create(); err != nil {
@@ -486,22 +482,26 @@ func (db *DB) recoverJournal() error {
 				if err == io.EOF {
 					break
 				}
-				return err
+				return errors.SetFile(err, file)
 			}
 
 			buf.Reset()
 			if _, err := buf.ReadFrom(r); err != nil {
 				if err == io.ErrUnexpectedEOF {
+					// This is error returned due to corruption, with strict == false.
 					continue
 				} else {
-					return err
+					return errors.SetFile(err, file)
 				}
 			}
-			if err := batch.decode(buf.Bytes()); err != nil {
-				return err
-			}
-			if err := batch.memReplay(mem); err != nil {
-				return err
+			if err := batch.memDecodeAndReplay(db.seq, buf.Bytes(), mem); err != nil {
+				if strict || !errors.IsCorrupted(err) {
+					return errors.SetFile(err, file)
+				} else {
+					db.s.logf("journal error: %v (skipped)", err)
+					// We won't apply sequence number as it might be corrupted.
+					continue
+				}
 			}
 
 			// Save sequence number.
@@ -566,7 +566,7 @@ func (db *DB) recoverJournal() error {
 }
 
 func (db *DB) get(key []byte, seq uint64, ro *opt.ReadOptions) (value []byte, err error) {
-	ikey := newIKey(key, seq, tSeek)
+	ikey := newIkey(key, seq, ktSeek)
 
 	em, fm := db.getMems()
 	for _, m := range [...]*memDB{em, fm} {
@@ -577,9 +577,13 @@ func (db *DB) get(key []byte, seq uint64, ro *opt.ReadOptions) (value []byte, er
 
 		mk, mv, me := m.mdb.Find(ikey)
 		if me == nil {
-			ukey, _, t, ok := parseIkey(mk)
-			if ok && db.s.icmp.uCompare(ukey, key) == 0 {
-				if t == tDel {
+			ukey, _, kt, kerr := parseIkey(mk)
+			if kerr != nil {
+				// Shouldn't have had happen.
+				panic(kerr)
+			}
+			if db.s.icmp.uCompare(ukey, key) == 0 {
+				if kt == ktDel {
 					return nil, ErrNotFound
 				}
 				return append([]byte{}, mv...), nil
@@ -594,7 +598,7 @@ func (db *DB) get(key []byte, seq uint64, ro *opt.ReadOptions) (value []byte, er
 	v.release()
 	if cSched {
 		// Trigger table compaction.
-		db.compTrigger(db.tcompTriggerC)
+		db.compSendTrigger(db.tcompCmdC)
 	}
 	return
 }
@@ -759,8 +763,8 @@ func (db *DB) SizeOf(ranges []util.Range) (Sizes, error) {
 
 	sizes := make(Sizes, 0, len(ranges))
 	for _, r := range ranges {
-		imin := newIKey(r.Start, kMaxSeq, tSeek)
-		imax := newIKey(r.Limit, kMaxSeq, tSeek)
+		imin := newIkey(r.Start, kMaxSeq, ktSeek)
+		imax := newIkey(r.Limit, kMaxSeq, ktSeek)
 		start, err := v.offsetOf(imin)
 		if err != nil {
 			return nil, err

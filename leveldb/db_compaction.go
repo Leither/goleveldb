@@ -84,7 +84,9 @@ func (c *cMem) flush(mem *memdb.DB, level int) error {
 
 	// Pick level.
 	if level < 0 {
-		level = s.version_NB().pickLevel(t.imin.ukey(), t.imax.ukey())
+		v := s.version()
+		level = v.pickLevel(t.imin.ukey(), t.imax.ukey())
+		v.release()
 	}
 	c.rec.addTableFile(level, t)
 
@@ -100,7 +102,7 @@ func (c *cMem) reset() {
 
 func (c *cMem) commit(journal, seq uint64) error {
 	c.rec.setJournalNum(journal)
-	c.rec.setSeq(seq)
+	c.rec.setSeqNum(seq)
 
 	// Commit changes.
 	return c.s.commit(c.rec)
@@ -232,9 +234,9 @@ func (db *DB) memCompaction() {
 	}
 
 	// Pause table compaction.
-	ch := make(chan struct{})
+	resumeC := make(chan struct{})
 	select {
-	case db.tcompPauseC <- (chan<- struct{})(ch):
+	case db.tcompPauseC <- (chan<- struct{})(resumeC):
 	case _, _ = <-db.closeC:
 		return
 	}
@@ -272,23 +274,25 @@ func (db *DB) memCompaction() {
 
 	// Resume table compaction.
 	select {
-	case <-ch:
+	case <-resumeC:
 	case _, _ = <-db.closeC:
 		return
 	}
 
 	// Trigger table compaction.
-	db.compTrigger(db.mcompTriggerC)
+	db.compSendTrigger(db.tcompCmdC)
 }
 
 func (db *DB) tableCompaction(c *compaction, noTrivial bool) {
+	defer c.release()
+
 	rec := new(sessionRecord)
-	rec.addCompactionPointer(c.level, c.imax)
+	rec.addCompPtr(c.level, c.imax)
 
 	if !noTrivial && c.trivial() {
 		t := c.tables[0][0]
 		db.logf("table@move L%d@%d -> L%d", c.level, t.file.Num(), c.level+1)
-		rec.deleteTable(c.level, t.file.Num())
+		rec.delTable(c.level, t.file.Num())
 		rec.addTableFile(c.level+1, t)
 		db.compactionTransact("table@move", func(cnt *compactionTransactCounter) (err error) {
 			return db.s.commit(rec)
@@ -301,23 +305,29 @@ func (db *DB) tableCompaction(c *compaction, noTrivial bool) {
 		for _, t := range tables {
 			stats[i].read += t.size
 			// Insert deleted tables into record
-			rec.deleteTable(c.level+i, t.file.Num())
+			rec.delTable(c.level+i, t.file.Num())
 		}
 	}
 	sourceSize := int(stats[0].read + stats[1].read)
 	minSeq := db.minSeq()
 	db.logf("table@compaction L%d·%d -> L%d·%d S·%s Q·%d", c.level, len(c.tables[0]), c.level+1, len(c.tables[1]), shortenb(sourceSize), minSeq)
 
-	var snapUkey []byte
-	var snapHasUkey bool
-	var snapSeq uint64
-	var snapIter int
-	var snapDropCnt int
-	var dropCnt int
+	var (
+		snapHasLastUkey bool
+		snapLastUkey    []byte
+		snapLastSeq     uint64
+		snapIter        int
+		snapKerrCnt     int
+		snapDropCnt     int
+
+		kerrCnt int
+		dropCnt int
+	)
 	db.compactionTransact("table@build", func(cnt *compactionTransactCounter) (err error) {
-		ukey := append([]byte{}, snapUkey...)
-		hasUkey := snapHasUkey
-		lseq := snapSeq
+		hasLastUkey := snapHasLastUkey // The key might has zero length, so this is necessary.
+		lastUkey := append([]byte{}, snapLastUkey...)
+		lastSeq := snapLastSeq
+		kerrCnt = snapKerrCnt
 		dropCnt = snapDropCnt
 		snapSched := snapIter == 0
 
@@ -353,9 +363,11 @@ func (db *DB) tableCompaction(c *compaction, noTrivial bool) {
 				continue
 			}
 
-			ikey := iKey(iter.Key())
+			ikey := iter.Key()
+			ukey, seq, kt, kerr := parseIkey(ikey)
 
-			if c.shouldStopBefore(ikey) && tw != nil {
+			// Skip this if key is corrupted.
+			if kerr == nil && c.shouldStopBefore(ikey) && tw != nil {
 				err = finish()
 				if err != nil {
 					return
@@ -367,32 +379,28 @@ func (db *DB) tableCompaction(c *compaction, noTrivial bool) {
 			// Scheduled for snapshot, snapshot will used to retry compaction
 			// if error occured.
 			if snapSched {
-				snapUkey = append(snapUkey[:0], ukey...)
-				snapHasUkey = hasUkey
-				snapSeq = lseq
+				snapHasLastUkey = hasLastUkey
+				snapLastUkey = append(snapLastUkey[:0], lastUkey...)
+				snapLastSeq = lastSeq
 				snapIter = i
+				snapKerrCnt = kerrCnt
 				snapDropCnt = dropCnt
 				snapSched = false
 			}
 
-			if seq, vt, ok := ikey.parseNum(); !ok {
-				// Don't drop error keys
-				ukey = ukey[:0]
-				hasUkey = false
-				lseq = kMaxSeq
-			} else {
-				if !hasUkey || db.s.icmp.uCompare(ikey.ukey(), ukey) != 0 {
-					// First occurrence of this user key
-					ukey = append(ukey[:0], ikey.ukey()...)
-					hasUkey = true
-					lseq = kMaxSeq
+			if kerr == nil {
+				if !hasLastUkey || db.s.icmp.uCompare(lastUkey, ukey) != 0 {
+					// First occurrence of this user key.
+					hasLastUkey = true
+					lastUkey = append(lastUkey[:0], ukey...)
+					lastSeq = kMaxSeq
 				}
 
-				drop := false
-				if lseq <= minSeq {
+				switch {
+				case lastSeq <= minSeq:
 					// Dropped because newer entry for same user key exist
-					drop = true // (A)
-				} else if vt == tDel && seq <= minSeq && c.baseLevelForKey(ukey) {
+					fallthrough // (A)
+				case kt == ktDel && seq <= minSeq && c.baseLevelForKey(lastUkey):
 					// For this user key:
 					// (1) there is no data in higher levels
 					// (2) data in lower levels will have larger seq numbers
@@ -400,14 +408,18 @@ func (db *DB) tableCompaction(c *compaction, noTrivial bool) {
 					//     smaller seq numbers will be dropped in the next
 					//     few iterations of this loop (by rule (A) above).
 					// Therefore this deletion marker is obsolete and can be dropped.
-					drop = true
-				}
-
-				lseq = seq
-				if drop {
+					lastSeq = seq
 					dropCnt++
 					continue
+				default:
+					lastSeq = seq
 				}
+			} else {
+				// Don't drop corrupted keys
+				hasLastUkey = false
+				lastUkey = lastUkey[:0]
+				lastSeq = kMaxSeq
+				kerrCnt++
 			}
 
 			// Create new table if not already
@@ -478,7 +490,7 @@ func (db *DB) tableCompaction(c *compaction, noTrivial bool) {
 	}, nil)
 
 	resultSize := int(stats[1].write)
-	db.logf("table@compaction committed F%s S%s D·%d T·%v", sint(len(rec.addedTables)-len(rec.deletedTables)), sshortenb(resultSize-sourceSize), dropCnt, stats[1].duration)
+	db.logf("table@compaction committed F%s S%s Ke·%d D·%d T·%v", sint(len(rec.addedTables)-len(rec.deletedTables)), sshortenb(resultSize-sourceSize), kerrCnt, dropCnt, stats[1].duration)
 
 	// Save compaction stats
 	for i := range stats {
@@ -494,14 +506,14 @@ func (db *DB) tableRangeCompaction(level int, umin, umax []byte) {
 			db.tableCompaction(c, true)
 		}
 	} else {
-		v := db.s.version_NB()
-
+		v := db.s.version()
 		m := 1
 		for i, t := range v.tables[1:] {
 			if t.overlaps(db.s.icmp, umin, umax, false) {
 				m = i + 1
 			}
 		}
+		v.release()
 
 		for level := 0; level < m; level++ {
 			if c := db.s.getCompactionRange(level, umin, umax); c != nil {
@@ -518,7 +530,9 @@ func (db *DB) tableAutoCompaction() {
 }
 
 func (db *DB) tableNeedCompaction() bool {
-	return db.s.version_NB().needCompaction()
+	v := db.s.version()
+	defer v.release()
+	return v.needCompaction()
 }
 
 func (db *DB) pauseCompaction(ch chan<- struct{}) {
@@ -538,10 +552,12 @@ type cIdle struct {
 }
 
 func (r cIdle) ack(err error) {
-	defer func() {
-		recover()
-	}()
-	r.ackC <- err
+	if r.ackC != nil {
+		defer func() {
+			recover()
+		}()
+		r.ackC <- err
+	}
 }
 
 type cRange struct {
@@ -559,6 +575,7 @@ func (r cRange) ack(err error) {
 	}
 }
 
+// This will trigger auto compation and/or wait for all compaction to be done.
 func (db *DB) compSendIdle(compC chan<- cCmd) (err error) {
 	ch := make(chan error)
 	defer close(ch)
@@ -580,6 +597,15 @@ func (db *DB) compSendIdle(compC chan<- cCmd) (err error) {
 	return err
 }
 
+// This will trigger auto compaction but will not wait for it.
+func (db *DB) compSendTrigger(compC chan<- cCmd) {
+	select {
+	case compC <- cIdle{}:
+	default:
+	}
+}
+
+// Send range compaction request.
 func (db *DB) compSendRange(compC chan<- cCmd, level int, min, max []byte) (err error) {
 	ch := make(chan error)
 	defer close(ch)
@@ -601,13 +627,6 @@ func (db *DB) compSendRange(compC chan<- cCmd, level int, min, max []byte) (err 
 	return err
 }
 
-func (db *DB) compTrigger(compTriggerC chan struct{}) {
-	select {
-	case compTriggerC <- struct{}{}:
-	default:
-	}
-}
-
 func (db *DB) mCompaction() {
 	var x cCmd
 
@@ -626,11 +645,14 @@ func (db *DB) mCompaction() {
 	for {
 		select {
 		case x = <-db.mcompCmdC:
-			db.memCompaction()
-			x.ack(nil)
-			x = nil
-		case <-db.mcompTriggerC:
-			db.memCompaction()
+			switch x.(type) {
+			case cIdle:
+				db.memCompaction()
+				x.ack(nil)
+				x = nil
+			default:
+				panic("leveldb: unknown command")
+			}
 		case _, _ = <-db.closeC:
 			return
 		}
@@ -661,7 +683,6 @@ func (db *DB) tCompaction() {
 		if db.tableNeedCompaction() {
 			select {
 			case x = <-db.tcompCmdC:
-			case <-db.tcompTriggerC:
 			case ch := <-db.tcompPauseC:
 				db.pauseCompaction(ch)
 				continue
@@ -677,7 +698,6 @@ func (db *DB) tCompaction() {
 			ackQ = ackQ[:0]
 			select {
 			case x = <-db.tcompCmdC:
-			case <-db.tcompTriggerC:
 			case ch := <-db.tcompPauseC:
 				db.pauseCompaction(ch)
 				continue
@@ -692,6 +712,8 @@ func (db *DB) tCompaction() {
 			case cRange:
 				db.tableRangeCompaction(cmd.level, cmd.min, cmd.max)
 				x.ack(nil)
+			default:
+				panic("leveldb: unknown command")
 			}
 			x = nil
 		}
